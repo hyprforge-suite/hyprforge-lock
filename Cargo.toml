@@ -38,7 +38,34 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # all, so without this there is no PNG decoder and every wallpaper
 # fails to load. Cargo unifies features across the dependency graph, so
 # declaring the formats here is what switches them on for iced.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+#
+# The full list, matching the workspace root's, and it must keep
+# matching — `check.sh`'s "Standalone crate dependency pins" step fails
+# the build when it drifts, which is how this line got written.
+#
+# Worth being clear about what that costs a lock screen, since it is the
+# one process on the machine that must not fail: nothing, in any build
+# that happens here. Feature unification means this crate *already*
+# links every decoder the root asks for whenever it is built inside the
+# workspace. This list only describes the standalone repository's build,
+# so keeping it in sync is what makes that build the same as the one
+# that was actually tested — and a wallpaper somebody saved as a .webp
+# is a real thing to be handed.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "tiff",
+    "bmp",
+    "ico",
+    "tga",
+    "qoi",
+    "pnm",
+    "hdr",
+    "exr",
+    "ff",
+] }
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 # Versions pinned to whatever smithay-client-toolkit 0.20 already pulls
