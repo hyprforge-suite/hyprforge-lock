@@ -41,7 +41,7 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface};
 use wayland_client::{Connection, QueueHandle};
 
-use hyprforge_authui::conversation::{Backend, Conversation, State};
+use hyprforge_authui::conversation::{Backend, Conversation, Press, State};
 use hyprforge_authui::Theme;
 use iced_runtime::core::{mouse, renderer, Rectangle, Size};
 use iced_runtime::user_interface::{Cache, UserInterface};
@@ -771,64 +771,24 @@ fn dispatch_key<B: hyprforge_authui::conversation::Backend>(
     // "just the keysym" to debug input writes the password to disk in a
     // barely-encoded form. This comment exists because that mistake was
     // made here once already.
-    match keysym {
-        Keysym::Return | Keysym::KP_Enter => match conversation.state() {
-            State::Telling { .. } => conversation.acknowledge(),
-            State::Failed { .. } => conversation.retry(),
-            _ => conversation.submit(),
+    //
+    // What a key *means* is `conversation::apply_press`, shared with the
+    // greeter — including that Escape and Backspace must dismiss a
+    // failed attempt, which was fixed here and not there for as long as
+    // there were two copies of it. This function is the translation
+    // from xkb and nothing else.
+    let press = match keysym {
+        Keysym::Return | Keysym::KP_Enter => Press::Enter,
+        Keysym::Escape => Press::Escape,
+        Keysym::BackSpace => Press::Backspace,
+        _ => match utf8 {
+            Some(text) => Press::Text(text),
+            // A modifier or a function key: nothing this prompt has a
+            // meaning for.
+            None => return,
         },
-        // Both of these check for `Failed` first, and both used to
-        // not. `clear` and `type_into` are no-ops in that state, so
-        // Escape and Backspace — the two keys a person actually
-        // reaches for after a wrong password — did nothing at all.
-        // The error stayed put and the lock screen read as frozen,
-        // on the one screen where that is frightening.
-        //
-        // The `_` arm below already dismissed the error for every
-        // other key; these two were matched before they could reach
-        // it.
-        Keysym::Escape => {
-            if matches!(conversation.state(), State::Failed { .. }) {
-                conversation.retry();
-            } else {
-                conversation.clear();
-            }
-        }
-        Keysym::BackSpace => {
-            if matches!(conversation.state(), State::Failed { .. }) {
-                conversation.retry();
-            } else {
-                let mut entered = conversation.typed().to_string();
-                entered.pop();
-                conversation.type_into(entered);
-            }
-        }
-        _ => {
-            // Any key at all leaves the failed state, so the user can
-            // simply start typing again rather than having to work
-            // out which key dismisses the error.
-            //
-            // The character that does the dismissing is kept: `retry`
-            // puts the conversation into `Working` while the backend
-            // starts over, and `type_into` buffers there rather than
-            // dropping it. Losing it meant someone retyping a password
-            // after "incorrect password" submitted it short, was told it
-            // was wrong again, and spent a third `pam_faillock` attempt
-            // on a password that was right all along.
-            if matches!(conversation.state(), State::Failed { .. }) {
-                conversation.retry();
-            }
-            if let Some(text) = utf8 {
-                // Control characters would otherwise count as typed
-                // characters and show a dot for nothing.
-                if !text.is_empty() && !text.chars().any(char::is_control) {
-                    let mut entered = conversation.typed().to_string();
-                    entered.push_str(&text);
-                    conversation.type_into(entered);
-                }
-            }
-        }
-    }
+    };
+    hyprforge_authui::conversation::apply_press(conversation, press);
 }
 
 impl<B: Backend + 'static> SeatHandler for LockScreen<B> {
