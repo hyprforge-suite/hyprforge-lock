@@ -24,7 +24,8 @@
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers};
+use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers};
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
@@ -33,25 +34,29 @@ use smithay_client_toolkit::session_lock::{
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
-    delegate_session_lock, delegate_shm, registry_handlers,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_session_lock, delegate_shm, registry_handlers,
 };
 use calloop_wayland_source::WaylandSource;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface};
-use wayland_client::{Connection, QueueHandle};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
+use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
+use crate::extras::{Command, Extras, Update};
+use crate::fingerprint::{self, Reader};
 use hyprforge_authui::conversation::{Backend, Conversation, Press, State};
+use hyprforge_authui::scene::{
+    self, Action, Fingerprint, Media, NotificationCount, Pacing, PowerAction, PowerMenu, Role, Scene, Status,
+};
 use hyprforge_authui::Theme;
-use iced_runtime::core::{mouse, renderer, Rectangle, Size};
+use iced_runtime::core::{mouse, renderer, Point, Rectangle, Size};
 use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_tiny_skia::graphics::Viewport;
-
-/// The screen sends no messages: input reaches the conversation through
-/// `key` rather than through iced, because the compositor hands
-/// keystrokes to this process directly.
-#[derive(Debug, Clone)]
-enum Nothing {}
 
 /// The shared colour type as iced wants it.
 fn iced_color(c: hyprforge_look::Color) -> iced_runtime::core::Color {
@@ -78,6 +83,17 @@ const CLOCK_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// makes a silent hang diagnosable instead of invisible.
 const GRANT_WARNING: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What runs beside the conversation once the lock is granted.
+#[derive(Debug, Clone, Copy)]
+pub struct Workers {
+    /// The PAM service whose account stack a fingerprint match must pass.
+    /// `None` leaves the reader off.
+    pub fingerprint: Option<&'static str>,
+    /// Log power actions instead of asking logind to perform them — see
+    /// [`Extras::start`].
+    pub rehearse_power: bool,
+}
+
 /// Why the lock screen stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -97,14 +113,158 @@ pub enum Outcome {
     Disconnected,
 }
 
+/// How often the surface repaints while a rejected password shakes —
+/// frame rate, for the half second it lasts.
+const ANIMATION: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// The largest avatar picture the screen will load, per side.
+///
+/// iced decodes the whole image and keeps it; the wallpaper already
+/// taught this project what an unbounded decode costs on a lock screen
+/// (296MB for one 36-megapixel file). A face drawn 72px across needs
+/// nowhere near this.
+const AVATAR_MAX_SIDE: u32 = 1024;
+
 /// One output's surface and the size the compositor asked for.
 struct Locked {
     surface: SessionLockSurface,
+    /// Logical size, as `configure` gave it.
     width: u32,
     height: u32,
     /// Kept so a monitor plugged in while locked can be matched against
     /// the surfaces that already exist.
     output: wl_output::WlOutput,
+    /// The output's scale, exact when `wp_fractional_scale_v1` gives it.
+    ///
+    /// Drawing at 1.0 and letting the compositor stretch the buffer is
+    /// what this used to do, and on a 1.6 output that is a blurry lock
+    /// screen — the same mistake the popups made and CLAUDE.md records.
+    scale: f64,
+    fractional: Option<WpFractionalScaleV1>,
+    /// Maps the physical-pixel buffer back onto the logical surface, so
+    /// the compositor does not scale it a second time.
+    viewport: Option<WpViewport>,
+    /// Each surface has its own widget tree — the one with the keyboard
+    /// draws the card, the others only a clock — so each keeps its own
+    /// cache rather than one being rebuilt against the other's shape
+    /// every frame.
+    cache: Cache,
+    /// Where the pointer is on this surface, in logical pixels, while it
+    /// is here at all.
+    pointer: Option<Point>,
+    /// The wallpaper at this surface's physical size, once the backdrop
+    /// worker has made it, and the size it was last asked for — so a
+    /// resize asks again and nothing else does.
+    backdrop: Option<iced_runtime::core::image::Handle>,
+    asked: Option<(u32, u32)>,
+}
+
+impl Locked {
+    /// The buffer's size in physical pixels.
+    fn physical(&self) -> (u32, u32) {
+        let s = if self.scale.is_finite() && self.scale > 0.0 { self.scale } else { 1.0 };
+        (
+            ((self.width as f64 * s).round() as u32).max(1),
+            ((self.height as f64 * s).round() as u32).max(1),
+        )
+    }
+}
+
+/// What the screen shows beyond the conversation — everything a
+/// [`Scene`] borrows that is not the conversation's own.
+#[derive(Default)]
+struct View {
+    status: Status,
+    fingerprint: Fingerprint,
+    media: Option<Media>,
+    /// In the order each application first spoke, so the pills do not
+    /// reshuffle as counts change.
+    notifications: Vec<NotificationCount>,
+    /// What logind will do. Empty until it has said, and empty means no
+    /// power button at all.
+    power_actions: Vec<PowerAction>,
+    menu: Option<PowerMenu>,
+    pacing: Pacing,
+    avatar: Option<std::path::PathBuf>,
+    /// The keymap's layouts in group order, and which group is active.
+    layouts: Vec<String>,
+    group: u32,
+}
+
+impl View {
+    fn apply(&mut self, update: Update) {
+        match update {
+            Update::Battery(battery) => self.status.battery = battery,
+            Update::Network(network) => self.status.network = network,
+            Update::Media(media) => self.media = media,
+            Update::Notification(app) => match self.notifications.iter_mut().find(|n| n.app == app) {
+                Some(existing) => existing.count = existing.count.saturating_add(1),
+                None => self.notifications.push(NotificationCount { app, count: 1 }),
+            },
+            Update::Power(actions) => {
+                self.power_actions = actions;
+                // A menu opened before logind answered, or listing
+                // something it no longer offers, is rebuilt from the
+                // answer rather than left pointing at a stale row.
+                if let Some(menu) = &mut self.menu {
+                    menu.actions = self.power_actions.clone();
+                    menu.selected = menu.selected.min(menu.actions.len().saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    /// One frame's scene for a surface.
+    #[allow(clippy::too_many_arguments)]
+    fn scene<'a, B: Backend>(
+        &'a self,
+        conversation: Option<&'a Conversation<B>>,
+        theme: &'a Theme,
+        username: &'a str,
+        caps_lock: bool,
+        role: Role,
+        output: (f32, f32),
+        now: std::time::Instant,
+    ) -> Scene<'a> {
+        const STARTING: &State = &State::Working;
+        let state = conversation.map_or(STARTING, |c| c.state());
+        let typed = conversation.map_or(0, |c| c.typed().chars().count());
+        let mut scene = Scene::new(state, username, theme, chrono::Local::now());
+        scene.caps_lock = caps_lock;
+        scene.role = role;
+        scene.output = output;
+        scene.mode = self.pacing.mode(state, typed, now);
+        if let Some(c) = conversation {
+            scene.submitted = c.submitted();
+            scene.rejection = self.pacing.rejection(state, c.submitted(), c.failures(), now);
+        }
+        scene.status = &self.status;
+        scene.fingerprint = &self.fingerprint;
+        scene.media = self.media.as_ref();
+        scene.notifications = &self.notifications;
+        scene.power = (!self.power_actions.is_empty()).then_some(self.menu.as_ref());
+        scene.avatar = self.avatar.as_deref();
+        scene
+    }
+}
+
+/// A picture for the avatar, if the user has one the screen can afford
+/// to load: `~/.face`, then AccountsService's copy — the two places a
+/// desktop keeps it. Undecodable or oversized files are skipped, not
+/// loaded and hoped about.
+fn avatar(username: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let candidates = home
+        .map(|h| h.join(".face"))
+        .into_iter()
+        .chain(std::iter::once(std::path::Path::new("/var/lib/AccountsService/icons").join(username)));
+    candidates.into_iter().find(|path| {
+        image::ImageReader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+            .is_some_and(|(w, h)| w > 0 && h > 0 && w <= AVATAR_MAX_SIDE && h <= AVATAR_MAX_SIDE)
+    })
 }
 
 pub struct LockScreen<B: Backend + 'static> {
@@ -118,6 +278,29 @@ pub struct LockScreen<B: Backend + 'static> {
     lock: Option<SessionLock>,
     surfaces: Vec<Locked>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// The surface the keyboard is on, which is the one that draws the
+    /// card. `None` until the compositor says, when the first surface
+    /// stands in.
+    focused: Option<wl_surface::WlSurface>,
+    /// Absent on a compositor without them, which falls back to drawing
+    /// at 1.0 — the old behaviour, blurry but correct.
+    fractional_manager: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
+    view: View,
+    /// The status, media and notification worker, and the fingerprint
+    /// reader. Both start when the lock is granted, never before — the
+    /// same rule as PAM, and the notification count is only meant to
+    /// cover what arrived while locked.
+    extras: Option<Extras>,
+    reader: Option<Reader>,
+    /// Prepares each output's wallpaper off the event loop. Started
+    /// before the lock, unlike the others: it reads a file this process
+    /// already chose to show, and asks nothing of anyone.
+    backdrops: Option<crate::backdrop::Backdrops>,
+    /// A finger matched and PAM's account stack agreed. The one way into
+    /// this session besides the conversation — see [`conclude`].
+    fingerprint_verified: bool,
 
     /// `None` until the compositor has actually granted the lock.
     ///
@@ -150,7 +333,6 @@ pub struct LockScreen<B: Backend + 'static> {
     /// Kept across frames so glyph rasterisation and layout are not
     /// redone from scratch every repaint.
     renderer: iced_tiny_skia::Renderer,
-    cache: Cache,
     /// Shown on the screen, so it has to be here rather than only in the
     /// conversation — which does not exist until the lock is granted.
     username: String,
@@ -184,7 +366,9 @@ impl<B: Backend + 'static> LockScreen<B> {
         theme: Theme,
         wake: Option<calloop::ping::PingSource>,
         self_test: Option<String>,
+        workers: Workers,
     ) -> Result<Outcome, LockError> {
+        let Workers { fingerprint: fingerprint_service, rehearse_power } = workers;
         let username = username.into();
         let theme_font_size = theme.font_size;
         let screen_font = hyprforge_authui::screen::font(&theme);
@@ -198,6 +382,9 @@ impl<B: Backend + 'static> LockScreen<B> {
         // the first configure anyway.
         let pool = SlotPool::new(4096, &shm).map_err(|e| LockError::Buffer(e.to_string()))?;
         let lock_state = SessionLockState::new(&globals, &qh);
+        let viewporter = globals.bind::<WpViewporter, Self, ()>(&qh, 1..=1, ()).ok();
+        let fractional_manager = globals.bind::<WpFractionalScaleManagerV1, Self, ()>(&qh, 1..=1, ()).ok();
+        let avatar = avatar(&username);
 
         let mut screen = LockScreen {
             registry: RegistryState::new(&globals),
@@ -209,6 +396,18 @@ impl<B: Backend + 'static> LockScreen<B> {
             lock: None,
             surfaces: Vec::new(),
             keyboard: None,
+            pointer: None,
+            focused: None,
+            // Both or neither: a fractional scale with nothing to map
+            // the bigger buffer back onto the surface would draw it at
+            // 1.6× the size, not 1.6× the sharpness.
+            fractional_manager: fractional_manager.filter(|_| viewporter.is_some()),
+            viewporter,
+            view: View { avatar, ..View::default() },
+            extras: None,
+            reader: None,
+            backdrops: None,
+            fingerprint_verified: false,
             conversation: None,
             theme,
             outcome: None,
@@ -222,7 +421,6 @@ impl<B: Backend + 'static> LockScreen<B> {
                 screen_font,
                 iced_runtime::core::Pixels(theme_font_size),
             ),
-            cache: Cache::default(),
             username: username.clone(),
             self_testing: self_test.is_some(),
             self_test,
@@ -256,6 +454,14 @@ impl<B: Backend + 'static> LockScreen<B> {
         WaylandSource::new(connection.clone(), queue)
             .insert(handle.clone())
             .map_err(|e| LockError::EventLoop(e.to_string()))?;
+
+        if screen.theme.wallpaper.is_some() {
+            let (backdrops, ready) = crate::backdrop::Backdrops::start();
+            screen.backdrops = Some(backdrops);
+            handle
+                .insert_source(ready, |_, _, screen: &mut LockScreen<B>| screen.take_backdrops())
+                .map_err(|e| LockError::EventLoop(e.to_string()))?;
+        }
 
         if let Some(wake) = wake {
             handle
@@ -303,16 +509,25 @@ impl<B: Backend + 'static> LockScreen<B> {
                 if let Some(conversation) = screen.conversation.as_mut() {
                     conversation.pump();
                 }
+                // The same reasoning for the two workers: their pings are
+                // the fast path, never the only one.
+                screen.collect();
                 screen.dirty = true;
                 // Fast while the authenticator is busy so the screen is
                 // visibly alive through pam_unix's deliberate pause;
                 // otherwise slow, which is what the clock needs. An idle
                 // lock screen no longer costs *nothing* — it costs one
                 // repaint a second — but a clock that does not tick is
-                // worse than the saving.
-                calloop::timer::TimeoutAction::ToDuration(
-                    if matches!(screen.state(), State::Working) { PULSE } else { CLOCK_TICK },
-                )
+                // worse than the saving. Frame rate only for the half
+                // second a rejected password shakes.
+                let now = std::time::Instant::now();
+                calloop::timer::TimeoutAction::ToDuration(if screen.view.pacing.animating(now) {
+                    ANIMATION
+                } else if matches!(screen.state(), State::Working) {
+                    PULSE
+                } else {
+                    CLOCK_TICK
+                })
             })
             .map_err(|e| LockError::EventLoop(e.to_string()))?;
 
@@ -325,6 +540,7 @@ impl<B: Backend + 'static> LockScreen<B> {
             if screen.granted && screen.conversation.is_none() {
                 if let Some(backend) = pending.take() {
                     screen.conversation = Some(Conversation::new(backend, username.clone()));
+                    screen.start_workers(&handle, fingerprint_service, rehearse_power, &username);
                     screen.mark_dirty();
                 }
             }
@@ -349,6 +565,32 @@ impl<B: Backend + 'static> LockScreen<B> {
                     eprintln!("self test: submitted, state is {:?}", screen.state());
                 }
             }
+            // A failure is timed from the first frame that can show it —
+            // after the self test above, which can cause one — and it
+            // needs frames at frame rate for the half second it shakes.
+            // The heartbeat cannot provide them: it chose its next wait
+            // before the failure existed, and waiting out a one-second
+            // tick is a shake that is over before it is ever drawn,
+            // which is what the first version of this did.
+            let began = match screen.conversation.as_ref() {
+                Some(conversation) => screen.view.pacing.observe(conversation.state(), std::time::Instant::now()),
+                None => false,
+            };
+            if began {
+                screen.mark_dirty();
+                let _ = handle.insert_source(
+                    calloop::timer::Timer::from_duration(ANIMATION),
+                    |_, _, screen: &mut LockScreen<B>| {
+                        screen.dirty = true;
+                        if screen.view.pacing.animating(std::time::Instant::now()) {
+                            calloop::timer::TimeoutAction::ToDuration(ANIMATION)
+                        } else {
+                            // One more frame, the settled one, then gone.
+                            calloop::timer::TimeoutAction::Drop
+                        }
+                    },
+                );
+            }
             if screen.dirty {
                 let before = screen.frames;
                 screen.draw_all();
@@ -372,7 +614,7 @@ impl<B: Backend + 'static> LockScreen<B> {
             // released.
             if let Some(end) = conclude(
                 screen.outcome,
-                screen.state().is_authenticated(),
+                screen.state().is_authenticated() || screen.fingerprint_verified,
                 screen.lock.is_some(),
             ) {
                 if let Some(lock) = screen.lock.take() {
@@ -410,12 +652,7 @@ impl<B: Backend + 'static> LockScreen<B> {
             return;
         };
         for output in self.outputs.outputs() {
-            if self.surfaces.iter().any(|l| l.output == output) {
-                continue;
-            }
-            let surface = self.compositor.create_surface(qh);
-            let locked = lock.create_lock_surface(surface, &output, qh);
-            self.surfaces.push(Locked { surface: locked, width: 0, height: 0, output });
+            self.cover(&lock, output, qh);
         }
         if self.surfaces.is_empty() {
             // No outputs means nothing can be drawn on, so the
@@ -426,10 +663,63 @@ impl<B: Backend + 'static> LockScreen<B> {
         self.mark_dirty();
     }
 
+    /// One output's lock surface, with the fractional-scale and viewport
+    /// objects that let it draw at the output's real resolution.
+    /// Nothing if the output already has one.
+    fn cover(&mut self, lock: &SessionLock, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
+        if self.surfaces.iter().any(|l| l.output == output) {
+            return;
+        }
+        let surface = self.compositor.create_surface(qh);
+        let fractional = self
+            .fractional_manager
+            .as_ref()
+            .map(|manager| manager.get_fractional_scale(&surface, qh, surface.clone()));
+        let viewport = fractional
+            .as_ref()
+            .and(self.viewporter.as_ref())
+            .map(|viewporter| viewporter.get_viewport(&surface, qh, ()));
+        // Until the compositor names the scale, the output's own integer
+        // one is the best guess — and drawing at it is never worse than
+        // drawing at 1.0.
+        let scale = self.outputs.info(&output).map_or(1, |info| info.scale_factor.max(1)) as f64;
+        let locked = lock.create_lock_surface(surface, &output, qh);
+        self.surfaces.push(Locked {
+            surface: locked,
+            width: 0,
+            height: 0,
+            output,
+            scale,
+            fractional,
+            viewport,
+            cache: Cache::default(),
+            pointer: None,
+            backdrop: None,
+            asked: None,
+        });
+        self.mark_dirty();
+    }
+
     fn draw_all(&mut self) {
         self.dirty = false;
         for index in 0..self.surfaces.len() {
             self.draw(index);
+        }
+    }
+
+    /// Which part this surface plays: the one with the keyboard draws the
+    /// card, every other output only a clock. Before the compositor has
+    /// said where the keyboard is, the first surface stands in — a card
+    /// on some screen beats none on any.
+    fn role(&self, index: usize) -> Role {
+        let focused = match &self.focused {
+            Some(focused) => self.surfaces.iter().position(|l| l.surface.wl_surface() == focused),
+            None => None,
+        };
+        if focused.unwrap_or(0) == index {
+            Role::Primary
+        } else {
+            Role::Secondary
         }
     }
 
@@ -439,6 +729,10 @@ impl<B: Backend + 'static> LockScreen<B> {
     /// the surface that stands between a locked machine and its user; it
     /// has no business depending on a GPU being in a good mood.
     fn draw(&mut self, index: usize) {
+        let role = self.role(index);
+        if self.surfaces.get(index).is_some_and(|l| l.width > 0 && l.height > 0) {
+            self.ask_backdrop(index);
+        }
         // Destructured rather than reached through `self`, because the
         // shm buffer borrows the pool for as long as it is being painted
         // and the renderer has to be usable at the same time. These are
@@ -446,17 +740,17 @@ impl<B: Backend + 'static> LockScreen<B> {
         let LockScreen {
             pool,
             renderer,
-            cache,
             theme,
             username,
             conversation,
             surfaces,
             frames,
             caps_lock,
+            view,
             ..
         } = self;
 
-        let Some(locked) = surfaces.get(index) else {
+        let Some(locked) = surfaces.get_mut(index) else {
             return;
         };
         // Nothing is drawn before the compositor says how big the surface
@@ -467,10 +761,18 @@ impl<B: Backend + 'static> LockScreen<B> {
         if width == 0 || height == 0 {
             return;
         }
+        // The buffer is physical pixels; everything iced lays out stays
+        // logical, and so does every pointer position the compositor
+        // reports — the viewport below is what reconciles the two.
+        let (buffer_width, buffer_height) = locked.physical();
+        let scale = buffer_width as f64 / width as f64;
 
-        let Ok((buffer, canvas)) =
-            pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888)
-        else {
+        let Ok((buffer, canvas)) = pool.create_buffer(
+            buffer_width as i32,
+            buffer_height as i32,
+            buffer_width as i32 * 4,
+            wl_shm::Format::Argb8888,
+        ) else {
             // Out of memory for a buffer. Leaving the previous frame up
             // is right: the surface stays as it was rather than going
             // blank, and the next event tries again.
@@ -483,48 +785,60 @@ impl<B: Backend + 'static> LockScreen<B> {
         // purpose. The buffer needs no channel shuffle at all, and
         // adding one "to fix" it would break every colour. There is a
         // test.
-        let Some(mut pixels) = tiny_skia::PixmapMut::from_bytes(canvas, width, height) else {
+        let Some(mut pixels) = tiny_skia::PixmapMut::from_bytes(canvas, buffer_width, buffer_height) else {
             return;
         };
-        let Some(mut mask) = tiny_skia::Mask::new(width, height) else {
+        let Some(mut mask) = tiny_skia::Mask::new(buffer_width, buffer_height) else {
             return;
         };
 
-        let state = conversation
-            .as_ref()
-            .map_or(&State::Working, |c| c.state());
         let size = Size::new(width as f32, height as f32);
-
-        let mut ui = UserInterface::<Nothing, iced_widget::Theme, iced_tiny_skia::Renderer>::build(
-            hyprforge_authui::screen::view(
-                state,
-                username,
-                theme,
-                chrono::Local::now(),
-                *caps_lock,
-            ),
+        let mut scene = view.scene(
+            conversation.as_ref(),
+            theme,
+            username,
+            *caps_lock,
+            role,
+            (width as f32, height as f32),
+            std::time::Instant::now(),
+        );
+        scene.backdrop = locked.backdrop.as_ref();
+        let mut ui = UserInterface::<Action, iced_widget::Theme, iced_tiny_skia::Renderer>::build(
+            hyprforge_authui::screen::view(scene),
             size,
-            std::mem::take(cache),
+            std::mem::take(&mut locked.cache),
             renderer,
         );
         ui.draw(
             renderer,
             &iced_widget::Theme::Dark,
             &renderer::Style { text_color: iced_color(theme.foreground) },
-            mouse::Cursor::Unavailable,
+            locked.pointer.map_or(mouse::Cursor::Unavailable, mouse::Cursor::Available),
         );
-        *cache = ui.into_cache();
+        locked.cache = ui.into_cache();
 
         renderer.draw(
             &mut pixels,
             &mut mask,
-            &Viewport::with_physical_size(Size::new(width, height), 1.0),
+            // Physical size plus the scale that produced it: iced
+            // multiplies every logical coordinate by this before it
+            // reaches a pixel, which is the whole of fractional scaling
+            // on this side.
+            &Viewport::with_physical_size(Size::new(buffer_width, buffer_height), scale as f32),
             &[Rectangle::with_size(size)],
             iced_color(theme.background),
         );
 
         let surface = locked.surface.wl_surface();
-        surface.damage_buffer(0, 0, width as i32, height as i32);
+        if let Some(viewport) = &locked.viewport {
+            // The buffer is bigger than the surface by the scale; this
+            // says so, so the compositor maps it back rather than
+            // drawing it scale-times too large.
+            viewport.set_destination(width as i32, height as i32);
+        } else {
+            surface.set_buffer_scale(scale.round().max(1.0) as i32);
+        }
+        surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
         if buffer.attach_to(surface).is_ok() {
             surface.commit();
             *frames += 1;
@@ -664,12 +978,19 @@ impl<B: Backend + 'static> KeyboardHandler for LockScreen<B> {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
-        eprintln!("keyboard focus entered a lock surface");
+        let index = self.surfaces.iter().position(|l| l.surface.wl_surface() == surface);
+        eprintln!("keyboard focus entered lock surface {}", index.map_or("?".into(), |i| i.to_string()));
+        // The card follows the keyboard: whichever output has it is the
+        // one a person is typing at.
+        if self.focused.as_ref() != Some(surface) {
+            self.focused = Some(surface.clone());
+            self.mark_dirty();
+        }
     }
 
     fn leave(
@@ -711,7 +1032,7 @@ impl<B: Backend + 'static> KeyboardHandler for LockScreen<B> {
         _: u32,
         modifiers: Modifiers,
         _: smithay_client_toolkit::seat::keyboard::RawModifiers,
-        _: u32,
+        group: u32,
     ) {
         // Caps Lock is the one modifier this screen has to show. Without
         // it a stuck key looks exactly like a forgotten password, and
@@ -721,6 +1042,27 @@ impl<B: Backend + 'static> KeyboardHandler for LockScreen<B> {
             self.caps_lock = modifiers.caps_lock;
             self.mark_dirty();
         }
+        // The layout group travels with the modifiers, so a layout
+        // switch is seen here.
+        if self.view.group != group {
+            self.view.group = group;
+            self.view.status.layout = crate::layout::active(&self.view.layouts, group);
+            self.mark_dirty();
+        }
+    }
+
+    /// The keymap arrives when the keyboard is bound and again whenever
+    /// the compositor changes it; its layout names are all this reads.
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        keymap: Keymap<'_>,
+    ) {
+        self.view.layouts = crate::layout::layouts(&keymap.as_string());
+        self.view.status.layout = crate::layout::active(&self.view.layouts, self.view.group);
+        self.mark_dirty();
     }
 
     /// Held keys repeat, so a held backspace clears a password the way
@@ -751,8 +1093,289 @@ impl<B: Backend + 'static> LockScreen<B> {
         let Some(conversation) = self.conversation.as_mut() else {
             return;
         };
-        dispatch_key(conversation, keysym, utf8);
+        let now = std::time::Instant::now();
+        let typed = conversation.typed().chars().count();
+        let showing = match (self.view.pacing.mode(conversation.state(), typed, now), conversation.state()) {
+            (scene::Mode::Idle, _) => Showing::Clock,
+            (_, State::Asking { .. }) if typed == 0 => Showing::EmptyCard,
+            _ => Showing::Card,
+        };
+        self.view.pacing.key(now);
         self.mark_dirty();
+
+        let menu = self.view.menu.as_ref();
+        match route(keysym, utf8.as_deref(), menu, !self.view.power_actions.is_empty(), showing) {
+            Route::Conversation => {
+                let Some(conversation) = self.conversation.as_mut() else { return };
+                dispatch_key(conversation, keysym, utf8);
+            }
+            Route::Wake => {}
+            Route::Rest => self.view.pacing = Pacing::default(),
+            Route::OpenMenu => {
+                self.view.menu = Some(PowerMenu { actions: self.view.power_actions.clone(), selected: 0 })
+            }
+            Route::CloseMenu => self.view.menu = None,
+            Route::MoveSelection(step) => {
+                if let Some(menu) = &mut self.view.menu {
+                    let rows = menu.actions.len().max(1) as isize;
+                    menu.selected = (menu.selected as isize + step).rem_euclid(rows) as usize;
+                }
+            }
+            Route::Power(action) => self.act(Action::Power(action)),
+            Route::Chosen => {
+                let chosen = self.view.menu.as_ref().and_then(|m| m.actions.get(m.selected).copied());
+                if let Some(action) = chosen {
+                    self.act(Action::Power(action));
+                }
+            }
+            Route::Media(action) => self.act(action),
+            Route::Swallow => {}
+        }
+    }
+
+    /// Does what a pointer target or a menu key asked for.
+    fn act(&mut self, action: Action) {
+        let send = |extras: &Option<Extras>, command| {
+            if let Some(extras) = extras {
+                extras.send(command);
+            }
+        };
+        match action {
+            Action::TogglePowerMenu => {
+                self.view.menu = match self.view.menu {
+                    Some(_) => None,
+                    None => Some(PowerMenu { actions: self.view.power_actions.clone(), selected: 0 }),
+                };
+            }
+            Action::Power(action) => {
+                // Only something logind offered. The menu is built from
+                // that list, but a click is a position, and this is the
+                // one place a stale tree could turn it into something
+                // else.
+                if self.view.power_actions.contains(&action) {
+                    self.view.menu = None;
+                    eprintln!("power: {} requested from the lock screen", action.label());
+                    send(&self.extras, Command::Power(action));
+                }
+            }
+            Action::MediaPrevious if self.view.media.is_some() => send(&self.extras, Command::MediaPrevious),
+            Action::MediaPlayPause if self.view.media.is_some() => send(&self.extras, Command::MediaPlayPause),
+            Action::MediaNext if self.view.media.is_some() => send(&self.extras, Command::MediaNext),
+            Action::MediaPrevious | Action::MediaPlayPause | Action::MediaNext => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// Starts the status worker and the fingerprint reader, and wires
+    /// their pings into the loop. Called once, when the lock is granted.
+    fn start_workers(
+        &mut self,
+        handle: &calloop::LoopHandle<'_, Self>,
+        fingerprint_service: Option<&'static str>,
+        rehearse_power: bool,
+        username: &str,
+    ) {
+        let (extras, wake) = Extras::start(rehearse_power);
+        self.extras = Some(extras);
+        let _ = handle.insert_source(wake, |_, _, screen: &mut Self| screen.collect());
+
+        if let Some(service) = fingerprint_service {
+            let (reader, wake) = Reader::start(service, username.to_string());
+            self.reader = Some(reader);
+            let _ = handle.insert_source(wake, |_, _, screen: &mut Self| screen.collect());
+        }
+    }
+
+    /// Hands each prepared backdrop to every surface it was made for — by
+    /// size, since that is what it was made to fit, and shared, since two
+    /// outputs of one size need one picture. One made for a size no
+    /// surface has any more is simply dropped.
+    fn take_backdrops(&mut self) {
+        let Some(backdrops) = &self.backdrops else { return };
+        while let Some(prepared) = backdrops.poll() {
+            let size = (prepared.width, prepared.height);
+            for locked in self.surfaces.iter_mut().filter(|l| l.physical() == size && l.asked == Some(size)) {
+                locked.backdrop = Some(prepared.handle.clone());
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Asks for this surface's backdrop if its size is new, unless another
+    /// surface of the same size already has.
+    fn ask_backdrop(&mut self, index: usize) {
+        let (Some(backdrops), Some(path)) = (&self.backdrops, &self.theme.wallpaper) else { return };
+        let Some(size) = self.surfaces.get(index).map(Locked::physical) else { return };
+        if self.surfaces[index].asked == Some(size) {
+            return;
+        }
+        let shared = self.surfaces.iter().find(|l| l.asked == Some(size)).map(|l| l.backdrop.clone());
+        let locked = &mut self.surfaces[index];
+        locked.asked = Some(size);
+        match shared {
+            Some(existing) => locked.backdrop = existing,
+            None => {
+                locked.backdrop = None;
+                backdrops.request(path.clone(), size, self.theme.dim, self.theme.background);
+            }
+        }
+    }
+
+    /// Applies whatever the two workers have posted.
+    fn collect(&mut self) {
+        let mut changed = false;
+        if let Some(extras) = self.extras.as_mut() {
+            // Bounded like `Conversation::pump`, for the same reason: a
+            // worker that posted without end must not stop the drawing.
+            for _ in 0..64 {
+                let Some(update) = extras.poll() else { break };
+                self.view.apply(update);
+                changed = true;
+            }
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            for _ in 0..64 {
+                let Some(event) = reader.poll() else { break };
+                changed = true;
+                self.view.fingerprint = match event {
+                    fingerprint::Event::Ready => Fingerprint::Ready,
+                    fingerprint::Event::Retry(why) => Fingerprint::Retry(why),
+                    fingerprint::Event::Exhausted => Fingerprint::Exhausted,
+                    fingerprint::Event::Unavailable => Fingerprint::Unavailable,
+                    fingerprint::Event::Verified => {
+                        eprintln!("fingerprint: matched, and the account check passed");
+                        self.fingerprint_verified = true;
+                        Fingerprint::Ready
+                    }
+                    fingerprint::Event::Refused(why) => {
+                        eprintln!("fingerprint: matched, but the account check refused: {why}");
+                        Fingerprint::Exhausted
+                    }
+                };
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
+    /// A left click at `at` on surface `index`: iced decides what is
+    /// under it, from the same tree that was drawn.
+    fn click(&mut self, index: usize, at: Point) {
+        self.view.pacing.key(std::time::Instant::now());
+        self.mark_dirty();
+        let role = self.role(index);
+        let LockScreen { renderer, theme, username, conversation, surfaces, caps_lock, view, .. } = self;
+        let Some(locked) = surfaces.get_mut(index) else { return };
+        if locked.width == 0 || locked.height == 0 {
+            return;
+        }
+        let size = Size::new(locked.width as f32, locked.height as f32);
+        let mut scene = view.scene(
+            conversation.as_ref(),
+            theme,
+            username,
+            *caps_lock,
+            role,
+            (size.width, size.height),
+            std::time::Instant::now(),
+        );
+        // The same tree that was drawn, so the click lands on what was
+        // on screen.
+        scene.backdrop = locked.backdrop.as_ref();
+        let mut ui = UserInterface::<Action, iced_widget::Theme, iced_tiny_skia::Renderer>::build(
+            hyprforge_authui::screen::view(scene),
+            size,
+            std::mem::take(&mut locked.cache),
+            renderer,
+        );
+        let events = [
+            iced_runtime::core::Event::Mouse(mouse::Event::CursorMoved { position: at }),
+            iced_runtime::core::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            iced_runtime::core::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ];
+        let mut actions = Vec::new();
+        ui.update(
+            &events,
+            mouse::Cursor::Available(at),
+            renderer,
+            &mut iced_runtime::core::clipboard::Null,
+            &mut actions,
+        );
+        locked.cache = ui.into_cache();
+        for action in actions {
+            self.act(action);
+        }
+    }
+}
+
+/// Where a key goes, before the conversation ever sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// The ordinary case: the password.
+    Conversation,
+    /// Only wakes the screen. Enter on the idle clock is someone asking
+    /// to see the card, not submitting an empty password — which on this
+    /// machine's stack would spend one of three `pam_faillock` attempts.
+    Wake,
+    /// Escape on an empty card: back to the clock.
+    Rest,
+    OpenMenu,
+    CloseMenu,
+    MoveSelection(isize),
+    Power(PowerAction),
+    /// Enter on the menu's highlighted row.
+    Chosen,
+    Media(Action),
+    /// Typed while the menu is open, and not one of its keys. Dropped —
+    /// never into the password, which the menu is covering.
+    Swallow,
+}
+
+/// What the screen is doing, as far as routing a key cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Showing {
+    /// The idle clock, nothing typed.
+    Clock,
+    /// The card, asking, with nothing typed yet.
+    EmptyCard,
+    /// Anything else: something typed, a failure, a message.
+    Card,
+}
+
+/// The routing rules, as a pure function so they can be tested without a
+/// compositor.
+fn route(keysym: Keysym, text: Option<&str>, menu: Option<&PowerMenu>, can_power: bool, showing: Showing) -> Route {
+    if let Some(menu) = menu {
+        return match keysym {
+            Keysym::Escape | Keysym::Tab => Route::CloseMenu,
+            Keysym::Up | Keysym::KP_Up => Route::MoveSelection(-1),
+            Keysym::Down | Keysym::KP_Down => Route::MoveSelection(1),
+            Keysym::Return | Keysym::KP_Enter => Route::Chosen,
+            _ => match text.and_then(|t| scene::power_action_for_key(menu, t)) {
+                Some(action) => Route::Power(action),
+                None => Route::Swallow,
+            },
+        };
+    }
+    match keysym {
+        // Tab has no meaning in a password — it is filtered as a control
+        // character anyway — so it is free to be the keyboard's way to
+        // the ⏻ button.
+        Keysym::Tab if can_power => Route::OpenMenu,
+        Keysym::XF86_AudioPlay | Keysym::XF86_AudioPause => Route::Media(Action::MediaPlayPause),
+        Keysym::XF86_AudioNext => Route::Media(Action::MediaNext),
+        Keysym::XF86_AudioPrev => Route::Media(Action::MediaPrevious),
+        Keysym::Return | Keysym::KP_Enter | Keysym::Escape | Keysym::BackSpace if showing == Showing::Clock => {
+            Route::Wake
+        }
+        // Escape on an empty card puts it away. Enter there is *not*
+        // swallowed like on the clock: with the card showing, an empty
+        // answer may be meant — `pam_unix`'s `nullok` accepts one — and
+        // a lock screen that refused to send it would be an account
+        // nobody could get back into.
+        Keysym::Escape if showing == Showing::EmptyCard => Route::Rest,
+        _ => Route::Conversation,
     }
 }
 
@@ -809,6 +1432,11 @@ impl<B: Backend + 'static> SeatHandler for LockScreen<B> {
             self.keyboard = self.seats.get_keyboard(qh, &seat, None).ok();
             eprintln!("keyboard bound: {}", self.keyboard.is_some());
         }
+        // The pointer only ever reaches the ⏻ button, the power menu and
+        // the media controls. Nothing it can click authenticates.
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seats.get_pointer(qh, &seat).ok();
+        }
     }
 
     fn remove_capability(
@@ -823,19 +1451,34 @@ impl<B: Backend + 'static> SeatHandler for LockScreen<B> {
                 keyboard.release();
             }
         }
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
 impl<B: Backend + 'static> CompositorHandler for LockScreen<B> {
+    /// The integer scale, which is only the answer on a compositor
+    /// without `wp_fractional_scale_v1` — where there is one, its exact
+    /// `preferred_scale` wins rather than whichever arrives last.
     fn scale_factor_changed(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        surface: &wl_surface::WlSurface,
+        factor: i32,
     ) {
+        if let Some(locked) = self.surfaces.iter_mut().find(|l| l.surface.wl_surface() == surface) {
+            let factor = f64::from(factor.max(1));
+            if locked.fractional.is_none() && locked.scale != factor {
+                locked.scale = factor;
+                self.dirty = true;
+            }
+        }
     }
 
     fn transform_changed(
@@ -879,16 +1522,10 @@ impl<B: Backend + 'static> OutputHandler for LockScreen<B> {
     /// of its own, or it shows whatever was on it before the lock — on a
     /// laptop being docked, that is the desktop of a locked machine.
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        let Some(lock) = &self.lock else {
+        let Some(lock) = self.lock.clone() else {
             return;
         };
-        if self.surfaces.iter().any(|l| l.output == output) {
-            return;
-        }
-        let surface = self.compositor.create_surface(qh);
-        let locked = lock.create_lock_surface(surface, &output, qh);
-        self.surfaces.push(Locked { surface: locked, width: 0, height: 0, output });
-        self.mark_dirty();
+        self.cover(&lock, output, qh);
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -917,10 +1554,67 @@ impl<B: Backend + 'static> ProvidesRegistryState for LockScreen<B> {
     registry_handlers![OutputState, SeatState];
 }
 
+impl<B: Backend + 'static> PointerHandler for LockScreen<B> {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let Some(index) = self.surfaces.iter().position(|l| l.surface.wl_surface() == &event.surface) else {
+                continue;
+            };
+            // Logical coordinates, which is what the widget tree is laid
+            // out in — the buffer's scale never reaches hit-testing.
+            let at = Point::new(event.position.0 as f32, event.position.1 as f32);
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.surfaces[index].pointer = Some(at);
+                }
+                PointerEventKind::Leave { .. } => self.surfaces[index].pointer = None,
+                PointerEventKind::Press { button, .. } if button == BTN_LEFT => self.click(index, at),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `wp_fractional_scale_v1`'s one event. Keyed by the surface it was
+/// created for, because each output has its own scale.
+impl<B: Backend + 'static> Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for LockScreen<B> {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        surface: &wl_surface::WlSurface,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // A numerator over 120, so 1.6 arrives as 192 — exact, where the
+        // integer scale would have rounded it to 2.
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            let scale = f64::from(scale) / 120.0;
+            if let Some(locked) = state.surfaces.iter_mut().find(|l| l.surface.wl_surface() == surface) {
+                if scale > 0.0 && locked.scale != scale {
+                    locked.scale = scale;
+                    state.dirty = true;
+                }
+            }
+        }
+    }
+}
+
+wayland_client::delegate_noop!(@<B: Backend + 'static> LockScreen<B>: ignore WpViewporter);
+wayland_client::delegate_noop!(@<B: Backend + 'static> LockScreen<B>: ignore WpViewport);
+wayland_client::delegate_noop!(@<B: Backend + 'static> LockScreen<B>: ignore WpFractionalScaleManagerV1);
+
 delegate_compositor!(@<B: Backend + 'static> LockScreen<B>);
 delegate_output!(@<B: Backend + 'static> LockScreen<B>);
 delegate_seat!(@<B: Backend + 'static> LockScreen<B>);
 delegate_keyboard!(@<B: Backend + 'static> LockScreen<B>);
+delegate_pointer!(@<B: Backend + 'static> LockScreen<B>);
 delegate_shm!(@<B: Backend + 'static> LockScreen<B>);
 delegate_session_lock!(@<B: Backend + 'static> LockScreen<B>);
 delegate_registry!(@<B: Backend + 'static> LockScreen<B>);
@@ -1068,6 +1762,60 @@ mod tests {
             "red must land where Argb8888 keeps red; if this fails, do not add a swizzle \
              without checking what iced_tiny_skia::engine::into_color does"
         );
+    }
+
+    fn menu() -> PowerMenu {
+        PowerMenu { actions: vec![PowerAction::Suspend, PowerAction::PowerOff], selected: 0 }
+    }
+
+    /// While the menu covers the card, nothing typed may reach the
+    /// password — including the menu's own letters, which choose a row
+    /// instead.
+    #[test]
+    fn nothing_typed_with_the_menu_open_reaches_the_password() {
+        let menu = menu();
+        for (keysym, text) in [
+            (Keysym::a, Some("a")),
+            (Keysym::h, Some("h")),
+            (Keysym::BackSpace, None),
+            (Keysym::space, Some(" ")),
+        ] {
+            let routed = route(keysym, text, Some(&menu), true, Showing::Card);
+            assert_ne!(routed, Route::Conversation, "{keysym:?}");
+        }
+        assert_eq!(route(Keysym::s, Some("s"), Some(&menu), true, Showing::Card), Route::Power(PowerAction::Suspend));
+        assert_eq!(route(Keysym::h, Some("h"), Some(&menu), true, Showing::Card), Route::Swallow, "not offered");
+        assert_eq!(route(Keysym::Escape, None, Some(&menu), true, Showing::Card), Route::CloseMenu);
+        assert_eq!(route(Keysym::Return, None, Some(&menu), true, Showing::Card), Route::Chosen);
+    }
+
+    /// Enter on the idle clock is asking to see the card. Sending it on
+    /// as an empty password would spend a `pam_faillock` attempt on a
+    /// password nobody typed.
+    #[test]
+    fn a_key_that_wakes_the_clock_is_never_an_answer() {
+        for keysym in [Keysym::Return, Keysym::KP_Enter, Keysym::Escape, Keysym::BackSpace] {
+            assert_eq!(route(keysym, None, None, true, Showing::Clock), Route::Wake, "{keysym:?}");
+        }
+        // A character, though, is the start of the password and must
+        // not be lost to the wake.
+        assert_eq!(route(Keysym::h, Some("h"), None, true, Showing::Clock), Route::Conversation);
+    }
+
+    /// With the card up, Enter on an empty field still goes through: an
+    /// empty password can be a real one (`nullok`), and refusing to send
+    /// it would lock that account out.
+    #[test]
+    fn enter_on_a_visible_empty_card_is_still_sent() {
+        assert_eq!(route(Keysym::Return, None, None, true, Showing::EmptyCard), Route::Conversation);
+        assert_eq!(route(Keysym::Escape, None, None, true, Showing::EmptyCard), Route::Rest);
+        assert_eq!(route(Keysym::Escape, None, None, true, Showing::Card), Route::Conversation);
+    }
+
+    #[test]
+    fn tab_opens_the_menu_only_when_there_is_one() {
+        assert_eq!(route(Keysym::Tab, None, None, true, Showing::Card), Route::OpenMenu);
+        assert_eq!(route(Keysym::Tab, None, None, false, Showing::Card), Route::Conversation);
     }
 
     /// Reporting a successful unlock for a session that was never

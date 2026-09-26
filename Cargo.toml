@@ -3,7 +3,7 @@ name = "hyprforge-lock"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "An ext-session-lock-v1 lock screen for Hyprland, authenticating against PAM and sharing its look with the greeter."
+description = "An ext-session-lock-v1 lock screen for Hyprland: PAM and fingerprint unlock, a status line, media and notification counts, a power menu, and a look shared with the greeter."
 repository = "https://github.com/adamrpostjr/hyprforge"
 documentation = "https://docs.rs/hyprforge-lock"
 readme = "README.md"
@@ -25,9 +25,17 @@ path = "src/main.rs"
 hyprforge-authui = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-paths = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
+# The status line's battery and network. Clients of UPower and
+# NetworkManager only: either daemon being absent is a status line
+# without that part, never a lock screen that fails.
+hyprforge-power = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-network = { git = "https://github.com/adamrpostjr/hyprforge" }
+# The wallpaper is prepared once per output through the suite's bounded
+# decoder — see src/backdrop.rs, and CLAUDE.md on the 296MB wallpaper.
+hyprforge-image = { git = "https://github.com/adamrpostjr/hyprforge" }
 # default-features off drops softbuffer: this paints into the buffer the
 # compositor hands over, so it has no use for a windowing backend.
-iced_tiny_skia = { version = "0.14", default-features = false, features = ["image"] }
+iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["image", "geometry"] }
 iced_runtime = "0.14"
 iced_widget = { version = "0.14", features = ["image"] }
 tiny-skia = "0.11"
@@ -80,7 +88,17 @@ pam-client2 = "0.5"
 zbus = { version = "5.18", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "rt"] }
 thiserror = "2"
+# fprintd's VerifyStatus signals and the notification monitor are
+# streams.
+futures-util = "0.3"
+# `wp_fractional_scale_v1` and `wp_viewporter`, so the lock draws at the
+# output's real resolution rather than being stretched — the same pair
+# hyprforge-popup uses, for the reason CLAUDE.md records.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 clap = { version = "4.6", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The keymap test asks the system's own xkbcli, and no wait on another
+# process goes unbounded here — not even in a test.
+hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }

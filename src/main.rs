@@ -3,6 +3,10 @@
 //! Runs as you, so it reads your own theme directly. The greeter reads
 //! an exported copy — see `hyprforge_authui::theme`.
 
+mod backdrop;
+mod extras;
+mod fingerprint;
+mod layout;
 mod logind;
 mod pam;
 mod surface;
@@ -11,7 +15,7 @@ use clap::Parser;
 #[cfg(debug_assertions)]
 use hyprforge_authui::conversation::{Backend, Prompt, Response};
 use hyprforge_authui::Theme;
-use surface::{LockScreen, Outcome};
+use surface::{LockScreen, Outcome, Workers};
 
 #[derive(Parser)]
 #[command(about = "Lock the session")]
@@ -180,6 +184,12 @@ fn main() -> std::process::ExitCode {
         eprintln!("locking {display} with a fake password (testing only)");
         let delay = std::time::Duration::from_millis(args.fake_delay.unwrap_or(0));
         let (fake, wake) = Fake::new(password, delay);
+        // The reader stays on for a hand-driven nested test, so the
+        // fingerprint card can be seen and a real finger tried against
+        // a session that is not the real one. A self test turns it off:
+        // its result must not depend on whether someone touched the
+        // sensor while it ran.
+        let fingerprint = args.type_in.is_none().then(pam::service_name);
         return report(LockScreen::run(
             connection,
             fake,
@@ -187,6 +197,9 @@ fn main() -> std::process::ExitCode {
             theme,
             Some(wake),
             args.type_in,
+            // A test lock still talks to the real system bus, so its
+            // power menu only rehearses.
+            Workers { fingerprint, rehearse_power: true },
         ));
     }
 
@@ -204,7 +217,8 @@ fn main() -> std::process::ExitCode {
     // talking to PAM once the session is locked. The ping is what lets it
     // answer later without the screen waiting.
     let (backend, wake) = pam::PamBackend::new(service);
-    report(LockScreen::run(connection, backend, username, theme, Some(wake), None))
+    let workers = Workers { fingerprint: Some(service), rehearse_power: false };
+    report(LockScreen::run(connection, backend, username, theme, Some(wake), None, workers))
 }
 
 /// Turns an outcome into an exit code, saying only what the layers below

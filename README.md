@@ -14,10 +14,35 @@ you a lock screen and nothing else.
 cargo build --release -p hyprforge-lock
 ```
 
-It depends on three other Hyprforge crates — `hyprforge-authui`,
-`hyprforge-paths` and `hyprforge-look` — taken as git dependencies on the
-main repository rather than from crates.io, which is where they will
-move once they are published. Nothing else here is Hyprforge-specific.
+It depends on six other Hyprforge crates — `hyprforge-authui`,
+`hyprforge-paths`, `hyprforge-look`, `hyprforge-image`, and the UPower
+and NetworkManager clients `hyprforge-power` and `hyprforge-network` —
+taken as git dependencies on the main repository rather than from
+crates.io, which is where they will move once they are published. Nothing
+else here is Hyprforge-specific.
+
+## What it shows
+
+An idle clock that brings up a frosted card when you type — avatar,
+name, the password as dots, the keyboard layout and Caps Lock — with a
+status line (layout, network, battery), media controls and per-app
+notification counts on the idle screen, and a power menu from ⏻ or Tab.
+A wrong password shakes the field red. On several monitors the card is
+on the one with the keyboard and the others show only the clock. It
+draws at each output's real resolution through `wp_fractional_scale_v1`.
+
+Every part beyond the password is somebody else's daemon, and each one
+being absent is a screen without that part, never a lock screen that
+fails: no UPower, no battery reading; no fprintd, no fingerprint.
+
+## Fingerprint
+
+With fprintd installed and a finger enrolled (`fprintd-enroll`), the lock
+listens for a finger beside the password prompt, talking to fprintd
+directly rather than through `pam_fprintd` — PAM can ask for one or the
+other in turn, never both at once. A match still has to pass the PAM
+*account* stack before the session unlocks, and three unrecognised
+fingers stop the reader until the next lock.
 
 ## Installing PAM
 
@@ -85,7 +110,11 @@ without touching a real account.
 
 It reports what PAM said and nothing more. Rate limiting, lockouts and
 delays are PAM's own configuration in `/etc/pam.d/`, not policy hidden in
-this binary. And while PAM is busy — `pam_unix` sleeps for about two
+this binary — with one exception it cannot avoid: fprintd keeps no count
+of failed fingers and PAM never sees them, so the three-miss limit on the
+reader is this binary's. Under `--fake-password` the power menu only
+rehearses, because a nested test lock still talks to the real system
+bus. And while PAM is busy — `pam_unix` sleeps for about two
 seconds after a wrong password — the screen keeps drawing and keeps
 accepting input; a lock screen that stops repainting is indistinguishable
 from one that crashed, and the user's only other option is a hard

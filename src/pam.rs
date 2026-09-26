@@ -293,6 +293,27 @@ fn authenticate(
     Response::Success
 }
 
+/// The account half of PAM on its own, for an unlock that did not come
+/// through PAM's auth stack at all — a fingerprint matched by fprintd.
+///
+/// Not optional, and the reason is the same as in [`authenticate`]: a
+/// finger proves who is standing there, not that the account is still
+/// allowed in. An expired or barred account must not be unlockable by
+/// touching a sensor when typing its password would be refused.
+///
+/// Blocking — PAM is — so it runs on the fingerprint worker's thread,
+/// never the event loop. The conversation is `conv_null`: the account
+/// stack has nothing to ask, and a module that tried would get a refusal
+/// rather than a prompt nobody is shown.
+pub fn account_permits(service: &str, username: &str) -> Result<(), String> {
+    let mut context =
+        pam_client2::Context::new(service, Some(username), pam_client2::conv_null::Conversation::default())
+            .map_err(|e| format!("couldn't start the account check: {e}"))?;
+    context
+        .acct_mgmt(pam_client2::Flag::NONE)
+        .map_err(|e| describe_account(e.code(), &e, service))
+}
+
 /// PAM's errors, in words a person can act on.
 ///
 /// The common one is deliberately plain: "Incorrect password" rather than
