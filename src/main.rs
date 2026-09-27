@@ -1,7 +1,7 @@
 //! A lock screen for Hyprland, sharing its look with the greeter.
 //!
 //! Runs as you, so it reads your own theme directly. The greeter reads
-//! an exported copy — see `hyprforge_authui::theme`.
+//! an exported copy — see `hyprforge_look::theme`.
 
 mod backdrop;
 mod extras;

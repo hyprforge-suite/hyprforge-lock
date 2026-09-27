@@ -83,8 +83,10 @@ calloop = "0.14"
 calloop-wayland-source = "0.4"
 pam-client2 = "0.5"
 # Run zbus on tokio rather than its default async-io executor. For the
-# logind LockedHint only. A current-thread runtime on a detached
-# thread, never the event loop: see src/logind.rs.
+# logind LockedHint, fprintd, and the extras' daemons (MPRIS, the
+# notification monitor, logind's power actions). Always a runtime on a
+# thread of its own, never the event loop: see src/logind.rs,
+# src/fingerprint.rs and src/extras.rs.
 zbus = { version = "5.18", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "rt"] }
 thiserror = "2"
