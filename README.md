@@ -4,7 +4,7 @@ An `ext-session-lock-v1` lock screen for Hyprland, sharing its look with
 the greeter (`hyprforge-greet`) — not by styling to match, but because
 both draw the same screen from `hyprforge-authui`.
 
-Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
+Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone. Installing this gets
 you a lock screen and nothing else.
 
