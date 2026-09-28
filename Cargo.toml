@@ -22,17 +22,17 @@ path = "src/main.rs"
 # workspace, the root Cargo.toml's `[patch]` section redirects these
 # straight back to the local `crates/` directories, so nothing here
 # touches the network; standalone, cargo fetches them from git.
-hyprforge-authui = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-paths = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-look = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-authui = "0.1"
+hyprforge-paths = "0.1"
+hyprforge-look = "0.1"
 # The status line's battery and network. Clients of UPower and
 # NetworkManager only: either daemon being absent is a status line
 # without that part, never a lock screen that fails.
-hyprforge-power = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-network = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-power = "0.1"
+hyprforge-network = "0.1"
 # The wallpaper is prepared once per output through the suite's bounded
 # decoder — see src/backdrop.rs, and CLAUDE.md on the 296MB wallpaper.
-hyprforge-image = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-image = "0.1"
 # default-features off drops softbuffer: this paints into the buffer the
 # compositor hands over, so it has no use for a windowing backend.
 iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["image", "geometry"] }
@@ -103,4 +103,4 @@ clap = { version = "4.6", features = ["derive"] }
 tempfile = "3"
 # The keymap test asks the system's own xkbcli, and no wait on another
 # process goes unbounded here — not even in a test.
-hyprforge-process = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-process = "0.1"

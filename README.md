@@ -17,8 +17,8 @@ cargo build --release -p hyprforge-lock
 It depends on six other Hyprforge crates — `hyprforge-authui`,
 `hyprforge-paths`, `hyprforge-look`, `hyprforge-image`, and the UPower
 and NetworkManager clients `hyprforge-power` and `hyprforge-network` —
-taken as git dependencies on the main repository rather than from
-crates.io, which is where they will move once they are published. Nothing
+published on crates.io,
+so cargo fetches them from there and never needs the main repository. Nothing
 else here is Hyprforge-specific.
 
 ## What it shows
