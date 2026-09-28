@@ -39,17 +39,6 @@ jobs:
   tier-1:
     name: "Tier 1 (no PAM, no compositor): build, clippy -D warnings, cargo test"
     runs-on: ubuntu-latest
-    env:
-      # Cargo fetches git dependencies with libgit2, which does not honour
-      # the `url.<..>.insteadOf` rewrite the step below installs — so the
-      # credential never reaches the clone and the build fails with
-      # "failed to authenticate", even though `git` itself would succeed.
-      # Cargo says as much in that error, and this is the setting it
-      # names: fetch with the git CLI instead, which does honour it.
-      #
-      # Goes with the SUITE_READ step below: when the suite repository
-      # becomes public, both stop being necessary.
-      CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,44 +67,6 @@ jobs:
         # *-sys crate performing a build-time system link beyond pam and
         # xkbcommon.
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libxkbcommon-dev pkg-config
-
-      - name: Let cargo fetch the suite while it is still a private repository
-        # This crate's Cargo.toml takes hyprforge-* as git dependencies on
-        # the suite repository. While that repository is PRIVATE, the
-        # built-in GITHUB_TOKEN cannot read it: an Actions token is scoped
-        # to the repository the workflow runs in, and says nothing about
-        # any other private repository in the same account. Cargo's fetch
-        # then fails with "failed to authenticate when downloading
-        # repository", which reads like a code problem and is not one.
-        #
-        # SUITE_READ is a fine-grained token with read-only Contents on
-        # the suite repository and nothing else. `insteadOf` rewrites the
-        # https:// URL cargo is about to clone so the credential is
-        # attached without the manifests naming a token anywhere.
-        #
-        # This whole step is scaffolding for the private phase. The day
-        # the suite repository becomes public, delete it and delete the
-        # secret: a public repository is fetched anonymously and this
-        # stops being necessary. If CI starts failing with that same
-        # authentication error for no apparent reason, the likeliest
-        # cause is the token having expired.
-        #
-        # An `extraheader` rather than a credential in the URL. The URL
-        # form was tried first and GitHub answered "Invalid username or
-        # token": credentials reached it and were refused, because
-        # `x-access-token:<pat>` is the shape of a GitHub App
-        # installation token, not of a personal access token. This is
-        # the same basic-auth header `actions/checkout` sets for itself,
-        # which is the one form known to work for both.
-        #
-        # The token arrives as an environment variable rather than being
-        # interpolated into the script, so it is never part of the
-        # command line a failing step would echo.
-        env:
-          SUITE_READ: ${{ secrets.SUITE_READ }}
-        run: |
-          git config --global http."https://github.com/".extraheader \
-            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SUITE_READ" | base64 -w0)"
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         # ubuntu-latest ships rustup already; `rustup show` is what
