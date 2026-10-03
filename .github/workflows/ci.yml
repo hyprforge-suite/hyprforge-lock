@@ -1,6 +1,6 @@
-# CI for the standalone hyprforge-lock repository (this file only takes
-# effect at `.github/workflows/ci.yml` — the path `./split.sh` produces
-# once `crates/hyprforge-lock` becomes a repository root).
+# CI for the hyprforge-lock repository. In the Hyprforge monorepo this directory
+# is a submodule at `crates/hyprforge-lock`; this file takes effect only here, at
+# the repository's root.
 #
 # What this checks: that the crate builds, that clippy is silent (a
 # clippy warning is a build failure in Hyprforge — see the upstream

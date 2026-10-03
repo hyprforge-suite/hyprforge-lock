@@ -6,8 +6,8 @@
 # looks like a regression in whatever was last touched.
 #
 # This is a copy of the pin the monorepo carries at its root — kept in
-# sync by hand, since `rust-toolchain.toml` does not travel with
-# `./split.sh` (only files inside the crate directory do). Raise it
+# step by hand, since this repository is the component's directory
+# alone (a submodule there) and the root's file is not in it. Raise it
 # deliberately, alongside the same version in the main repository.
 [toolchain]
 channel = "1.97.1"
