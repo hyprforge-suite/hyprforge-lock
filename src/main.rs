@@ -9,6 +9,7 @@ mod fingerprint;
 mod layout;
 mod logind;
 mod pam;
+mod supervise;
 mod surface;
 
 use clap::Parser;
@@ -63,6 +64,17 @@ struct Args {
     #[cfg(debug_assertions)]
     #[arg(long, value_name = "MS", requires = "fake_password")]
     fake_delay: Option<u64>,
+
+    /// Run the lock itself rather than supervising it. Set by the
+    /// supervisor on the copy it starts — see `supervise`.
+    #[arg(long, hide = true)]
+    child: bool,
+
+    /// Draw only the conversation: the default theme, no avatar, no
+    /// status worker, no fingerprint reader. The supervisor asks for this
+    /// from the second crash on.
+    #[arg(long, hide = true)]
+    safe: bool,
 }
 
 /// A backend that accepts one fixed password. Testing only.
@@ -135,6 +147,12 @@ impl Backend for Fake {
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
 
+    // Everything below runs in a child the supervisor can replace when it
+    // crashes. This process only waits on it — see `supervise`.
+    if !args.child {
+        return supervise::run();
+    }
+
     // Captured before `--display` can overwrite it, because "the session
     // you are actually using" is defined by what this process would have
     // connected to on its own. Only the testing path needs it, and that
@@ -153,7 +171,16 @@ fn main() -> std::process::ExitCode {
     // font size or an undecodable wallpaper panics it — see
     // `renderable` — and a panic here leaves the session locked with
     // nothing running to unlock it.
-    let theme = hyprforge_authui::screen::renderable(Theme::load(&theme_path()).unwrap_or_default());
+    // Safe mode reads no theme file at all: the defaults have no
+    // wallpaper, and every value in them is already one the renderer takes.
+    let theme = hyprforge_authui::screen::renderable(if args.safe {
+        Theme::default()
+    } else {
+        Theme::load(&theme_path()).unwrap_or_default()
+    });
+    if args.safe {
+        eprintln!("safe mode: default theme, no avatar, no status, no fingerprint");
+    }
 
     // The fake backend, in debug builds only. Two conditions, because
     // the first one on its own was not the guarantee its own comment
@@ -189,7 +216,7 @@ fn main() -> std::process::ExitCode {
         // a session that is not the real one. A self test turns it off:
         // its result must not depend on whether someone touched the
         // sensor while it ran.
-        let fingerprint = args.type_in.is_none().then(pam::service_name);
+        let fingerprint = (args.type_in.is_none() && !args.safe).then(pam::service_name);
         return report(LockScreen::run(
             connection,
             fake,
@@ -199,7 +226,7 @@ fn main() -> std::process::ExitCode {
             args.type_in,
             // A test lock still talks to the real system bus, so its
             // power menu only rehearses.
-            Workers { fingerprint, rehearse_power: true },
+            Workers { fingerprint, rehearse_power: true, safe: args.safe },
         ));
     }
 
@@ -217,7 +244,8 @@ fn main() -> std::process::ExitCode {
     // talking to PAM once the session is locked. The ping is what lets it
     // answer later without the screen waiting.
     let (backend, wake) = pam::PamBackend::new(service);
-    let workers = Workers { fingerprint: Some(service), rehearse_power: false };
+    let fingerprint = (!args.safe).then_some(service);
+    let workers = Workers { fingerprint, rehearse_power: false, safe: args.safe };
     report(LockScreen::run(connection, backend, username, theme, Some(wake), None, workers))
 }
 
@@ -228,8 +256,10 @@ fn report(outcome: Result<Outcome, surface::LockError>) -> std::process::ExitCod
         Ok(Outcome::Unlocked) => std::process::ExitCode::SUCCESS,
         // Both causes are already reported where they're diagnosed, and
         // in detail this layer doesn't have. The exit code is the part
-        // that differs: a refusal means nothing got locked.
-        Ok(Outcome::Refused) => std::process::ExitCode::FAILURE,
+        // that differs: a refusal means nothing got locked — and it is
+        // its own code because the supervisor reads a refused *relaunch*
+        // as the restore option being off.
+        Ok(Outcome::Refused) => std::process::ExitCode::from(supervise::EXIT_REFUSED),
         Ok(Outcome::Revoked) => std::process::ExitCode::SUCCESS,
         Ok(Outcome::Disconnected) => {
             eprintln!("lost the connection; the session stays locked");

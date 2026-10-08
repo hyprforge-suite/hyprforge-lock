@@ -92,6 +92,12 @@ pub struct Workers {
     /// Log power actions instead of asking logind to perform them — see
     /// [`Extras::start`].
     pub rehearse_power: bool,
+    /// Draw only the conversation: no status worker (battery, network,
+    /// media, notifications, the power menu) and no avatar picture. The
+    /// supervisor's second relaunch asks for this — every input dropped
+    /// here is one more place a crash could have come from (see
+    /// `crate::supervise`).
+    pub safe: bool,
 }
 
 /// Why the lock screen stopped.
@@ -368,7 +374,7 @@ impl<B: Backend + 'static> LockScreen<B> {
         self_test: Option<String>,
         workers: Workers,
     ) -> Result<Outcome, LockError> {
-        let Workers { fingerprint: fingerprint_service, rehearse_power } = workers;
+        let Workers { fingerprint: fingerprint_service, rehearse_power, safe } = workers;
         let username = username.into();
         let theme_font_size = theme.font_size;
         let screen_font = hyprforge_authui::screen::font(&theme);
@@ -384,7 +390,7 @@ impl<B: Backend + 'static> LockScreen<B> {
         let lock_state = SessionLockState::new(&globals, &qh);
         let viewporter = globals.bind::<WpViewporter, Self, ()>(&qh, 1..=1, ()).ok();
         let fractional_manager = globals.bind::<WpFractionalScaleManagerV1, Self, ()>(&qh, 1..=1, ()).ok();
-        let avatar = avatar(&username);
+        let avatar = if safe { None } else { avatar(&username) };
 
         let mut screen = LockScreen {
             registry: RegistryState::new(&globals),
@@ -540,7 +546,7 @@ impl<B: Backend + 'static> LockScreen<B> {
             if screen.granted && screen.conversation.is_none() {
                 if let Some(backend) = pending.take() {
                     screen.conversation = Some(Conversation::new(backend, username.clone()));
-                    screen.start_workers(&handle, fingerprint_service, rehearse_power, &username);
+                    screen.start_workers(&handle, fingerprint_service, rehearse_power, safe, &username);
                     screen.mark_dirty();
                 }
             }
@@ -1173,11 +1179,14 @@ impl<B: Backend + 'static> LockScreen<B> {
         handle: &calloop::LoopHandle<'_, Self>,
         fingerprint_service: Option<&'static str>,
         rehearse_power: bool,
+        safe: bool,
         username: &str,
     ) {
-        let (extras, wake) = Extras::start(rehearse_power);
-        self.extras = Some(extras);
-        let _ = handle.insert_source(wake, |_, _, screen: &mut Self| screen.collect());
+        if !safe {
+            let (extras, wake) = Extras::start(rehearse_power);
+            self.extras = Some(extras);
+            let _ = handle.insert_source(wake, |_, _, screen: &mut Self| screen.collect());
+        }
 
         if let Some(service) = fingerprint_service {
             let (reader, wake) = Reader::start(service, username.to_string());

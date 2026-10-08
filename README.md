@@ -80,8 +80,9 @@ restarting the compositor, or:
 hyprctl --instance <N> eval 'hl.clear_crashed_lockscreen()'
 ```
 
-So development and testing happen against a disposable nested
-compositor, never the real one:
+What it does about its own crashes is the next section; it changes
+none of this. So development and testing happen against a disposable
+nested compositor, never the real one:
 
 ```
 ./testing/nested.sh
@@ -105,6 +106,29 @@ the check). Never test a *wrong* password against real PAM either —
 typos there locks the account, which is worse than a locked screen.
 `--type-in <wrong>` against `--fake-password` exercises the failure path
 without touching a real account.
+
+## When it crashes
+
+The binary you run is a supervisor. It starts a copy of itself with
+`--child`, which does all the work, and waits; it never connects to
+Wayland or renders, so nothing that crashes the screen can reach it.
+When the child crashes — a panic, or a signal — the supervisor starts
+another, and Hyprland hands the dead lock to it. From the second crash
+on, the copy runs in safe mode: the default theme, no wallpaper, no
+avatar, no status line or power menu, no fingerprint reader. A fourth
+crash within a minute and it stops (exit 4), leaving the session locked
+behind Hyprland's own screen. Nothing the supervisor does unlocks.
+
+The takeover needs Hyprland's `misc:allow_session_lock_restore`, which
+is off by default. With it off the relaunch is refused, and the
+supervisor exits 3 naming the option; the session stays locked as the
+crash left it. Hyprforge's Settings app turns it on from its Set up page.
+
+To stand in for a crash when testing, `kill -ABRT` the child (`pgrep -P
+<supervisor>`). `kill -SEGV` from outside does not work: Rust's standard
+library catches SIGSEGV to detect stack overflows and, for a signal that
+was not a real fault, carries on. To abandon a test lock, kill the
+supervisor before the child, or the child is simply started again.
 
 ## What it deliberately does not do
 
