@@ -220,6 +220,23 @@ impl View {
         }
     }
 
+    /// Opens the power menu, or closes it if it is open.
+    ///
+    /// Only when logind has offered something. The ⏻ button is not drawn
+    /// and Tab does not reach it while `power_actions` is empty, so this
+    /// is the third door, and the one that must hold if a click ever
+    /// arrives anyway: an empty menu would be a control that does
+    /// nothing. `--safe` relies on it — the status worker that asks
+    /// logind never starts there, so the list stays empty and there is
+    /// no power menu at all, rather than one that cannot act.
+    fn toggle_menu(&mut self) {
+        self.menu = match self.menu {
+            Some(_) => None,
+            None if self.power_actions.is_empty() => None,
+            None => Some(PowerMenu { actions: self.power_actions.clone(), selected: 0 }),
+        };
+    }
+
     /// One frame's scene for a surface.
     #[allow(clippy::too_many_arguments)]
     fn scene<'a, B: Backend>(
@@ -1147,12 +1164,7 @@ impl<B: Backend + 'static> LockScreen<B> {
             }
         };
         match action {
-            Action::TogglePowerMenu => {
-                self.view.menu = match self.view.menu {
-                    Some(_) => None,
-                    None => Some(PowerMenu { actions: self.view.power_actions.clone(), selected: 0 }),
-                };
-            }
+            Action::TogglePowerMenu => self.view.toggle_menu(),
             Action::Power(action) => {
                 // Only something logind offered. The menu is built from
                 // that list, but a click is a position, and this is the
@@ -1771,6 +1783,35 @@ mod tests {
             "red must land where Argb8888 keeps red; if this fails, do not add a swizzle \
              without checking what iced_tiny_skia::engine::into_color does"
         );
+    }
+
+    /// What `--safe` leaves: a view no status worker has ever spoken to.
+    /// Neither the button, nor Tab, nor a stray click may produce a power
+    /// menu there — a menu whose actions nothing can carry out.
+    #[test]
+    fn safe_mode_offers_no_power_menu_by_any_route() {
+        let theme = Theme::default();
+        let mut view = View::default();
+        let scene = view.scene(
+            None::<&Conversation<AlwaysRejects>>,
+            &theme,
+            "someone",
+            false,
+            Role::Primary,
+            (1920.0, 1080.0),
+            std::time::Instant::now(),
+        );
+        assert!(scene.power.is_none(), "the ⏻ button is drawn");
+        let can_power = !view.power_actions.is_empty();
+        assert_ne!(route(Keysym::Tab, None, None, can_power, Showing::Card), Route::OpenMenu, "Tab opens it");
+        view.toggle_menu();
+        assert!(view.menu.is_none(), "a click opens an empty menu");
+
+        // The control the assertions above are measured against: once
+        // logind has answered, every one of those routes does open it.
+        view.apply(Update::Power(vec![PowerAction::Suspend]));
+        view.toggle_menu();
+        assert!(view.menu.is_some());
     }
 
     fn menu() -> PowerMenu {

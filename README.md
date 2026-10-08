@@ -115,7 +115,9 @@ Wayland or renders, so nothing that crashes the screen can reach it.
 When the child crashes — a panic, or a signal — the supervisor starts
 another, and Hyprland hands the dead lock to it. From the second crash
 on, the copy runs in safe mode: the default theme, no wallpaper, no
-avatar, no status line or power menu, no fingerprint reader. A fourth
+avatar, no status line, no fingerprint reader, and no power menu — not
+its ⏻ button either, since with nothing asking logind it could carry
+out none of what it offered. A fourth
 crash within a minute and it stops (exit 4), leaving the session locked
 behind Hyprland's own screen. Nothing the supervisor does unlocks.
 
