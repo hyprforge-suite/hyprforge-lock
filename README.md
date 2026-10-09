@@ -8,6 +8,10 @@ Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone. Installing this gets
 you a lock screen and nothing else.
 
+![The lock screen at rest: a large clock, the date, a media card and notification counts over the wallpaper](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/lock-idle.png)
+
+![The lock screen asking for a password: a frosted card with the user's initial, name and a password field](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/lock.png)
+
 ## Building
 
 ```
