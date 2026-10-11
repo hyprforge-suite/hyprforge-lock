@@ -69,8 +69,8 @@ account stack is empty and falls through to `/etc/pam.d/other`
 PAM's own auth stack has just accepted it.
 
 If no `hyprforge-lock` PAM service is installed, the code falls back to
-`hyprlock` and then `login` — useful on a machine that already has one
-of those configured, but the fallback still needs one of them to exist.
+`login`, which declares both stacks. It never falls back to `hyprlock`,
+for the reason above.
 
 ## Testing it safely — read this before running the binary
 

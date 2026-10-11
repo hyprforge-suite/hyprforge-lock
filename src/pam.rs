@@ -32,21 +32,25 @@ use std::sync::mpsc::{Receiver, Sender};
 
 /// The PAM service to authenticate against.
 ///
-/// `hyprforge-lock` if it exists, falling back to `hyprlock` and then
-/// `login`. Falling back matters: PAM refuses to authenticate against a
-/// service with no configuration file, so a missing
-/// `/etc/pam.d/hyprforge-lock` would mean nobody can unlock — and on a
-/// machine that already runs hyprlock, its config is exactly the right
-/// shape to borrow.
+/// `hyprforge-lock` if it exists, otherwise `login`. Falling back matters:
+/// PAM refuses to authenticate against a service with no configuration
+/// file, so a missing `/etc/pam.d/hyprforge-lock` would mean nobody can
+/// unlock.
+///
+/// **Not `hyprlock`**, though it is the obvious file to borrow and this
+/// once did. It declares `auth include login` and nothing else, so its
+/// account stack falls through to `/etc/pam.d/other`'s `pam_deny` — and
+/// [`authenticate`] checks the account too. On a machine with hyprlock
+/// installed and no file of our own, every correct password was accepted
+/// and then refused, which is a lock screen nobody can get out of. `login`
+/// declares both stacks on every distribution that ships it.
 pub fn service_name() -> &'static str {
-    for candidate in ["hyprforge-lock", "hyprlock"] {
-        if std::path::Path::new("/etc/pam.d").join(candidate).exists() {
-            // Leaked once at startup; the process is a lock screen and
-            // this string outlives everything else in it anyway.
-            return Box::leak(candidate.to_string().into_boxed_str());
-        }
-    }
-    "login"
+    choose_service(|name| std::path::Path::new("/etc/pam.d").join(name).exists())
+}
+
+/// [`service_name`]'s decision, apart from the filesystem it asks.
+fn choose_service(exists: impl Fn(&str) -> bool) -> &'static str {
+    if exists("hyprforge-lock") { "hyprforge-lock" } else { "login" }
 }
 
 /// What the UI thread asks the PAM thread to do.
@@ -541,6 +545,16 @@ mod tests {
         let message = describe_account(pam_client2::ErrorCode::PERM_DENIED, &"raw", "hyprlock");
         assert!(message.contains("/etc/pam.d/hyprlock"), "{message}");
         assert!(message.contains("account"), "{message}");
+    }
+
+    /// hyprlock's PAM file has no account stack, so borrowing it refuses
+    /// every correct password — a machine with hyprlock and without our
+    /// own file has to get `login`, never `hyprlock`.
+    #[test]
+    fn a_missing_pam_file_falls_back_to_login_not_hyprlock() {
+        assert_eq!(choose_service(|name| name == "hyprlock" || name == "login"), "login");
+        assert_eq!(choose_service(|_| false), "login");
+        assert_eq!(choose_service(|_| true), "hyprforge-lock");
     }
 
     /// The PAM file shipped with the crate has to declare both stacks:
