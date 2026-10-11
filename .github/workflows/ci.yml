@@ -25,7 +25,7 @@
 #
 # A green run means "the code is internally consistent". It does not
 # mean "the code agrees with PAM, logind, or a real compositor" — those
-# are exactly the questions the monorepo's later check.sh tiers exist to
+# are exactly the questions the monorepo's live tiers (`tools/hf`) exist to
 # ask, each gated on the thing it actually asks rather than shared
 # across an `--ignored` run that would silently never run here.
 

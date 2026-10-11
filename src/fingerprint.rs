@@ -344,9 +344,9 @@ mod tests {
     /// module asks before it claims anything, and checks the one signal
     /// it trusts to unlock has the shape it deserializes. Never claims
     /// the device and never starts a verification — the sensor does not
-    /// even light. Run by `check.sh` when fprintd is reachable.
+    /// even light. Run by the suite's `tools/hf check` when fprintd is reachable.
     #[test]
-    #[ignore = "needs fprintd; check.sh runs it"]
+    #[ignore = "needs fprintd; the suite's live tier runs it"]
     fn live_fprintd_answers_what_the_lock_asks() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {

@@ -46,7 +46,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # declaring the formats here is what switches them on for iced.
 #
 # The full list, matching the workspace root's, and it must keep
-# matching — `check.sh`'s "Standalone crate dependency pins" step fails
+# matching — `tools/hf check`'s "Standalone crate dependency pins" step fails
 # the build when it drifts, which is how this line got written.
 #
 # Worth being clear about what that costs a lock screen, since it is the
